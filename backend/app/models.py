@@ -93,6 +93,7 @@ class FinancialStatement(Base):
     capex: Mapped[Decimal | None] = mapped_column(Money)
     # Balance sheet (as of period_end)
     cash: Mapped[Decimal | None] = mapped_column(Money)
+    short_term_investments: Mapped[Decimal | None] = mapped_column(Money)
     total_assets: Mapped[Decimal | None] = mapped_column(Money)
     total_liabilities: Mapped[Decimal | None] = mapped_column(Money)
     total_equity: Mapped[Decimal | None] = mapped_column(Money)
@@ -128,3 +129,21 @@ class Deal(Base):
     consideration: Mapped[str | None] = mapped_column(String(16))  # cash | stock | mixed
     source_url: Mapped[str]
     notes: Mapped[str | None]
+
+
+class DataQualityFlag(Base):
+    """Result of an automated accounting check on one statement row (see app/validation.py)."""
+
+    __tablename__ = "data_quality_flags"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), index=True
+    )
+    statement_id: Mapped[int] = mapped_column(
+        ForeignKey("financial_statements.id", ondelete="CASCADE"), index=True
+    )
+    check: Mapped[str] = mapped_column(String(32))
+    severity: Mapped[str] = mapped_column(String(8))  # error | warning | info
+    message: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -4,10 +4,10 @@ Companies label the same concept differently, and switch tags over time (e.g. th
 2018 ASC 606 move from SalesRevenueNet to RevenueFromContractWithCustomer...). The
 first tag with a value for a given filing+period wins.
 
-Deliberately left out: component tags like SalesRevenueGoodsNet or CostOfServices.
-When a company reports goods and services separately without a total, picking one
-would silently understate revenue. A missing value gets flagged by validation; a
-wrong one doesn't.
+Component tags like SalesRevenueGoodsNet / SalesRevenueServicesNet are not direct
+candidates: picking one when a company reports both without a total would silently
+understate revenue. Instead, normalize.derive sums whichever are present, but only
+when no total tag exists (CRM tagged its whole FY2018 revenue as services).
 """
 
 from dataclasses import dataclass
@@ -87,6 +87,15 @@ FIELDS: dict[str, FieldSpec] = {
             "Cash",
         ),
     ),
+    "short_term_investments": FieldSpec(
+        "instant",
+        (
+            "ShortTermInvestments",
+            "MarketableSecuritiesCurrent",
+            "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+            "AvailableForSaleSecuritiesCurrent",
+        ),
+    ),
     "total_assets": FieldSpec("instant", ("Assets",)),
     "total_liabilities": FieldSpec("instant", ("Liabilities",)),
     "total_equity": FieldSpec(
@@ -101,6 +110,8 @@ FIELDS: dict[str, FieldSpec] = {
 
 # Tags read only as inputs to derived fields (see normalize.derive).
 HELPER_TAGS: dict[str, FieldSpec] = {
+    "SalesRevenueGoodsNet": FieldSpec("duration", ("SalesRevenueGoodsNet",)),
+    "SalesRevenueServicesNet": FieldSpec("duration", ("SalesRevenueServicesNet",)),
     "Depreciation": FieldSpec("duration", ("Depreciation",)),
     "AmortizationOfIntangibleAssets": FieldSpec("duration", ("AmortizationOfIntangibleAssets",)),
     "LiabilitiesAndStockholdersEquity": FieldSpec("instant", ("LiabilitiesAndStockholdersEquity",)),
@@ -117,6 +128,13 @@ HELPER_TAGS: dict[str, FieldSpec] = {
     "ShortTermBorrowings": FieldSpec("instant", ("ShortTermBorrowings",)),
     "CommercialPaper": FieldSpec("instant", ("CommercialPaper",)),
     "LongTermDebt": FieldSpec("instant", ("LongTermDebt",)),
+    # Last-resort debt components, used only when none of the above exist (they are
+    # often footnote detail of the totals above, so adding them would double count).
+    "ConvertibleNotesPayable": FieldSpec(
+        "instant", ("ConvertibleNotesPayable", "ConvertibleLongTermNotesPayable")
+    ),
+    "ConvertibleNotesPayableCurrent": FieldSpec("instant", ("ConvertibleNotesPayableCurrent",)),
+    "SecuredLongTermDebt": FieldSpec("instant", ("SecuredLongTermDebt",)),
 }
 
 # Cover-page share count, used when the balance sheet omits CommonStockSharesOutstanding.

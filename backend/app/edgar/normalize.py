@@ -22,6 +22,7 @@ ANNUAL_FORMS = {"10-K", "10-K/A"}
 MIN_ANNUAL_DAYS, MAX_ANNUAL_DAYS = 350, 380
 
 STANDARD_FIELDS = [*FIELDS, "total_debt"]
+BALANCE_SHEET_FIELDS = [f for f, spec in FIELDS.items() if spec.kind == "instant"] + ["total_debt"]
 
 PeriodKey = tuple[str, date]  # (accession, period_end)
 
@@ -79,6 +80,8 @@ class _FactIndex:
 
 def _discover_periods(namespace: dict) -> dict[PeriodKey, dict]:
     periods: dict[PeriodKey, dict] = {}
+    # Helper tags (e.g. revenue components) can fill a period but never create one:
+    # they show up in footnotes for stray periods.
     for spec in FIELDS.values():
         if spec.kind != "duration":
             continue
@@ -131,12 +134,29 @@ def _total_debt(h: dict[str, float | None]) -> tuple[float | None, str | None]:
     elif current:
         parts = current
     else:
-        return None, None
+        parts = [
+            n
+            for n in (
+                "ConvertibleNotesPayable",
+                "ConvertibleNotesPayableCurrent",
+                "SecuredLongTermDebt",
+            )
+            if h[n] is not None
+        ]
+        if not parts:
+            return None, None
     return sum(h[n] for n in parts), "derived:" + "+".join(parts)
 
 
 def derive(row: dict, helpers: dict[str, float | None], sources: dict[str, str]) -> None:
     """Fill fields that have no direct tag from related ones."""
+    components = [
+        n for n in ("SalesRevenueGoodsNet", "SalesRevenueServicesNet") if helpers[n] is not None
+    ]
+    if row["revenue"] is None and components:
+        row["revenue"] = sum(helpers[n] for n in components)
+        sources["revenue"] = "derived:" + "+".join(components)
+
     if row["gross_profit"] is None and None not in (row["revenue"], row["cost_of_revenue"]):
         row["gross_profit"] = row["revenue"] - row["cost_of_revenue"]
         sources["gross_profit"] = "derived:revenue-cost_of_revenue"
@@ -171,6 +191,13 @@ def _carry_forward(rows: list[dict]) -> None:
     for period_rows in by_period.values():
         period_rows.sort(key=lambda r: (r["filed_date"], r["accession"]))
         for prev, row in zip(period_rows, period_rows[1:], strict=False):
+            # A filing without this period's balance sheet can still contain stray
+            # instant values, e.g. restated opening equity in the equity statement.
+            # Mixing those with carried assets breaks Assets = Liabilities + Equity,
+            # so the balance sheet is carried as a block.
+            if row["total_assets"] is None and prev["total_assets"] is not None:
+                for field in BALANCE_SHEET_FIELDS:
+                    row[field] = None
             for field in STANDARD_FIELDS:
                 if row[field] is None and prev[field] is not None:
                     row[field] = prev[field]
@@ -210,12 +237,12 @@ def normalize_company_facts(company_facts: dict) -> list[dict]:
             if tag:
                 sources[field] = tag
 
+        helpers = {name: index.lookup(spec, period)[1] for name, spec in HELPER_TAGS.items()}
+        derive(row, helpers, sources)
+
         # Skip periods that only exist because of a stray footnote fact.
         if row["revenue"] is None and row["net_income"] is None:
             continue
-
-        helpers = {name: index.lookup(spec, period)[1] for name, spec in HELPER_TAGS.items()}
-        derive(row, helpers, sources)
 
         # The cover-page count only describes the filing's own (latest) period.
         if (

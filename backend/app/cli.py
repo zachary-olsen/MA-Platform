@@ -8,6 +8,7 @@ python -m app.cli show MSFT --as-of 2020-01-01
 
 import argparse
 import csv
+from collections import Counter
 from datetime import date
 
 import pandas as pd
@@ -18,10 +19,12 @@ from app.config import BACKEND_DIR, settings
 from app.db import SessionLocal
 from app.edgar.client import FACTS_URL, SUBMISSIONS_URL, EdgarClient
 from app.edgar.normalize import STANDARD_FIELDS, normalize_company_facts
-from app.models import Company, FinancialStatement, RawFiling
-from app.queries import statements_as_of
+from app.models import Company, DataQualityFlag, FinancialStatement, RawFiling
+from app.queries import metrics_as_of, statements_as_of
+from app.validation import validate_company
 
 UNIVERSE_CSV = BACKEND_DIR / "data" / "universe.csv"
+SEVERITIES = ("error", "warning", "info")
 
 
 def load_universe(tickers: list[str] | None) -> list[dict]:
@@ -79,12 +82,49 @@ def ingest_company(session: Session, client: EdgarClient, entry: dict, refresh: 
     facts = cached_fetch(session, client, company, "companyfacts", refresh)
     rows = normalize_company_facts(facts)
 
+    # Deleting statements cascades to their data quality flags.
     session.execute(delete(FinancialStatement).where(FinancialStatement.company_id == company.id))
     if rows:
         session.execute(
             insert(FinancialStatement), [{"company_id": company.id, **row} for row in rows]
         )
     return len(rows)
+
+
+def validate_stored(session: Session, company: Company) -> Counter:
+    statements = session.scalars(
+        select(FinancialStatement).where(FinancialStatement.company_id == company.id)
+    )
+    rows = [
+        {
+            "id": s.id,
+            "period_end": s.period_end,
+            "filed_date": s.filed_date,
+            "accession": s.accession,
+            "tag_sources": s.tag_sources,
+            **{f: None if getattr(s, f) is None else float(getattr(s, f)) for f in STANDARD_FIELDS},
+        }
+        for s in statements
+    ]
+    flags = validate_company(rows)
+
+    session.execute(delete(DataQualityFlag).where(DataQualityFlag.company_id == company.id))
+    session.add_all(
+        DataQualityFlag(
+            company_id=company.id,
+            statement_id=f.statement_id,
+            check=f.check,
+            severity=f.severity,
+            message=f.message,
+        )
+        for f in flags
+    )
+    return Counter(f.severity for f in flags)
+
+
+def _format_counts(row_count: int, counts: Counter) -> str:
+    severities = ", ".join(f"{counts[s]} {s}" for s in SEVERITIES)
+    return f"{row_count:>4} statement rows | {severities}"
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -102,19 +142,68 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         for entry in universe:
             with SessionLocal.begin() as session:
                 count = ingest_company(session, client, entry, args.refresh)
-            print(f"{entry['ticker']:<6} {count:>4} statement rows")
+                company = session.scalar(select(Company).where(Company.cik == int(entry["cik"])))
+                session.flush()
+                counts = validate_stored(session, company)
+            print(f"{entry['ticker']:<6} {_format_counts(count, counts)}")
+
+
+def _companies(session: Session, tickers: list[str]) -> list[Company]:
+    stmt = select(Company).order_by(Company.ticker)
+    if tickers:
+        stmt = stmt.where(Company.ticker.in_([t.upper() for t in tickers]))
+    companies = list(session.scalars(stmt))
+    if not companies:
+        raise SystemExit("No matching companies ingested")
+    return companies
+
+
+def _company(session: Session, ticker: str) -> Company:
+    company = session.scalar(
+        select(Company).where(Company.ticker == ticker.upper()).order_by(Company.is_active.desc())
+    )
+    if company is None:
+        raise SystemExit(f"{ticker} not ingested")
+    return company
+
+
+def cmd_validate(args: argparse.Namespace) -> None:
+    with SessionLocal.begin() as session:
+        for company in _companies(session, args.tickers):
+            counts = validate_stored(session, company)
+            row_count = session.query(FinancialStatement).filter_by(company_id=company.id).count()
+            print(f"{company.ticker:<6} {_format_counts(row_count, counts)}")
+
+
+def cmd_flags(args: argparse.Namespace) -> None:
+    allowed = SEVERITIES[: SEVERITIES.index(args.severity) + 1]
+    with SessionLocal() as session:
+        stmt = (
+            select(Company.ticker, FinancialStatement, DataQualityFlag)
+            .join(FinancialStatement, FinancialStatement.id == DataQualityFlag.statement_id)
+            .join(Company, Company.id == DataQualityFlag.company_id)
+            .where(DataQualityFlag.severity.in_(allowed))
+            .order_by(Company.ticker, FinancialStatement.period_end, FinancialStatement.filed_date)
+        )
+        if args.ticker:
+            stmt = stmt.where(Company.id == _company(session, args.ticker).id)
+        results = session.execute(stmt).all()
+
+    for ticker, statement, flag in results:
+        print(
+            f"{ticker:<6} FY{statement.fiscal_year} filed {statement.filed_date}  "
+            f"{flag.severity:<7} {flag.check:<24} {flag.message}"
+        )
+    print(f"\n{len(results)} flags ({' + '.join(allowed)})")
 
 
 def cmd_show(args: argparse.Namespace) -> None:
     as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
     with SessionLocal() as session:
-        company = session.scalar(
-            select(Company)
-            .where(Company.ticker == args.ticker.upper())
-            .order_by(Company.is_active.desc())
-        )
-        if company is None:
-            raise SystemExit(f"{args.ticker} not ingested")
+        company = _company(session, args.ticker)
+        if args.metrics:
+            _show_metrics(session, company, as_of, args.years)
+            return
         statements = statements_as_of(session, as_of, [company.id])
 
     if not statements:
@@ -140,6 +229,42 @@ def cmd_show(args: argparse.Namespace) -> None:
         print(f"  FY{year}: {info}")
 
 
+PERCENT_METRICS = [
+    "revenue_growth",
+    "revenue_cagr_3y",
+    "gross_margin",
+    "operating_margin",
+    "ebitda_margin",
+    "net_margin",
+    "fcf_margin",
+    "capex_to_revenue",
+    "effective_tax_rate",
+    "roic",
+]
+MULTIPLE_METRICS = ["fcf_conversion", "net_debt_to_ebitda", "debt_to_equity", "interest_coverage"]
+AMOUNT_METRICS = ["revenue", "ebitda", "fcf", "net_debt"]
+
+
+def _show_metrics(session: Session, company: Company, as_of: date, years: int) -> None:
+    df = metrics_as_of(session, as_of, [company.id]).tail(years).set_index("fiscal_year")
+    if df.empty:
+        raise SystemExit(f"No filings for {company.ticker} as of {as_of}")
+
+    def fmt(column: str, value) -> str:
+        if pd.isna(value):
+            return "—"
+        if column in AMOUNT_METRICS:
+            return f"{value / 1e6:,.0f}"
+        if column in PERCENT_METRICS:
+            return f"{value:.1%}"
+        return f"{value:.2f}x"
+
+    columns = AMOUNT_METRICS + PERCENT_METRICS + MULTIPLE_METRICS
+    table = pd.DataFrame({year: {c: fmt(c, df.at[year, c]) for c in columns} for year in df.index})
+    print(f"{company.name}, metrics as known on {as_of}. Amounts in USD millions.")
+    print(table.to_string())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(required=True)
@@ -153,7 +278,19 @@ def main() -> None:
     p_show.add_argument("ticker")
     p_show.add_argument("--as-of", help="YYYY-MM-DD; only use filings public by this date")
     p_show.add_argument("--years", type=int, default=5)
+    p_show.add_argument("--metrics", action="store_true", help="Show derived metrics instead")
     p_show.set_defaults(func=cmd_show)
+
+    p_validate = sub.add_parser("validate", help="Re-run accounting checks on stored data")
+    p_validate.add_argument("tickers", nargs="*")
+    p_validate.set_defaults(func=cmd_validate)
+
+    p_flags = sub.add_parser("flags", help="List data quality flags")
+    p_flags.add_argument("ticker", nargs="?")
+    p_flags.add_argument(
+        "--severity", choices=SEVERITIES, default="warning", help="Minimum severity to show"
+    )
+    p_flags.set_defaults(func=cmd_flags)
 
     args = parser.parse_args()
     args.func(args)

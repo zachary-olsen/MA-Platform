@@ -141,3 +141,60 @@ def test_fiscal_year_label():
     assert fiscal_year_for(date(2024, 6, 30)) == 2024
     assert fiscal_year_for(date(2025, 1, 31)) == 2025  # Jan fiscal year end (e.g. CRM)
     assert fiscal_year_for(date(2022, 1, 1)) == 2021  # 53-week year spilling into January
+
+
+def test_revenue_from_components_only_without_total():
+    rows = normalize_company_facts(
+        payload(
+            NetIncomeLoss=[fact(10, FY24, FILING_24)],
+            SalesRevenueGoodsNet=[fact(60, FY24, FILING_24)],
+            SalesRevenueServicesNet=[fact(40, FY24, FILING_24)],
+        )
+    )
+    assert rows[0]["revenue"] == 100
+    assert (
+        rows[0]["tag_sources"]["revenue"] == "derived:SalesRevenueGoodsNet+SalesRevenueServicesNet"
+    )
+
+    rows = normalize_company_facts(
+        payload(
+            Revenues=[fact(100, FY24, FILING_24)],
+            SalesRevenueServicesNet=[fact(40, FY24, FILING_24)],
+        )
+    )
+    assert rows[0]["revenue"] == 100
+
+
+def test_balance_sheet_carried_as_block():
+    # The later filing has no FY23 balance sheet but restates FY23 equity in its
+    # equity statement; that stray value must not be mixed with carried assets.
+    end = "2023-06-30"
+    rows = by_key(
+        normalize_company_facts(
+            payload(
+                Revenues=[fact(80, FY23, FILING_23), fact(80, FY23, FILING_24)],
+                Assets=[fact(500, end, FILING_23)],
+                Liabilities=[fact(300, end, FILING_23)],
+                StockholdersEquity=[fact(200, end, FILING_23), fact(150, end, FILING_24)],
+            )
+        )
+    )
+    later = rows[(FILING_24[0], end)]
+    assert (later["total_assets"], later["total_liabilities"], later["total_equity"]) == (
+        500,
+        300,
+        200,
+    )
+
+
+def test_last_resort_debt_tags_only_without_standard_ones():
+    end = "2024-06-30"
+    base = {
+        "Revenues": [fact(100, FY24, FILING_24)],
+        "ConvertibleLongTermNotesPayable": [fact(50, end, FILING_24)],
+        "SecuredLongTermDebt": [fact(10, end, FILING_24)],
+    }
+    assert normalize_company_facts(payload(**base))[0]["total_debt"] == 60
+
+    with_standard = {**base, "LongTermDebtNoncurrent": [fact(70, end, FILING_24)]}
+    assert normalize_company_facts(payload(**with_standard))[0]["total_debt"] == 70
