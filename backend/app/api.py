@@ -319,8 +319,10 @@ def valuation(
     mc = analysis.monte_carlo
     monte_carlo = None
     if mc is not None:
+        # Drop the outer 1% tails rather than clipping them, which would pile them into
+        # the edge bins and draw false spikes.
         lo, hi = np.percentile(mc.values, [1, 99])
-        counts, edges = np.histogram(np.clip(mc.values, lo, hi), bins=HISTOGRAM_BINS)
+        counts, edges = np.histogram(mc.values, bins=HISTOGRAM_BINS, range=(lo, hi))
         monte_carlo = {
             "draws": mc.draws,
             "discarded": mc.discarded,

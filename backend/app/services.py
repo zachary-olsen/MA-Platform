@@ -176,7 +176,7 @@ def football_field(session: Session, company_id: int, as_of: date, dcf: DCFAnaly
                 "high": high,
                 "mid": _implied_price(t, multiple, float(values.median())),
                 "kind": "comps",
-                "detail": f"peer {label} {q_lo:.1f}x-{q_hi:.1f}x (interquartile, n={len(values)})",
+                "detail": f"Peer IQR {q_lo:.1f}×–{q_hi:.1f}× · n={len(values)}",
             })  # fmt: skip
 
     grid = dcf.sensitivity.to_numpy()
@@ -187,7 +187,7 @@ def football_field(session: Session, company_id: int, as_of: date, dcf: DCFAnaly
             "high": float(np.nanmax(grid)),
             "mid": dcf.result.value_per_share,
             "kind": "dcf",
-            "detail": "WACC ±1%, terminal growth ±1%",
+            "detail": "WACC ±1%, terminal g ±1%",
         })  # fmt: skip
     if dcf.monte_carlo is not None:
         p = dcf.monte_carlo.percentiles
@@ -197,7 +197,7 @@ def football_field(session: Session, company_id: int, as_of: date, dcf: DCFAnaly
             "high": p[90],
             "mid": p[50],
             "kind": "monte_carlo",
-            "detail": f"P10-P90 of {len(dcf.monte_carlo.values):,} draws",
+            "detail": f"P10–P90 of {len(dcf.monte_carlo.values):,} draws",
         })  # fmt: skip
 
     return {"price": dcf.assumptions.price, "bars": bars}
