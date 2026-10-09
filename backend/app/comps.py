@@ -37,10 +37,10 @@ MULTIPLES: dict[str, tuple[str, str]] = {
 }
 
 
-def valuation_snapshot(session: Session, as_of: date) -> pd.DataFrame:
+def valuation_snapshot(session: Session, as_of: date, materialized: bool = True) -> pd.DataFrame:
     """One row per company: identity, latest fundamentals and metrics, market data,
     EV and multiples, all as known on `as_of`."""
-    metrics = metrics_as_of(session, as_of, latest_only=True)
+    metrics = metrics_as_of(session, as_of, latest_only=True, materialized=materialized)
     if metrics.empty:
         return metrics
 
@@ -100,14 +100,39 @@ def valuation_snapshot(session: Session, as_of: date) -> pd.DataFrame:
 
 
 def _median_excluding_self(values: pd.Series) -> pd.Series:
+    """For each element, the median of the *other* non-missing values (vectorized).
+
+    Sort once; removing the element at sorted position i shifts every later element
+    left by one, so the median of the remaining m = n - 1 values is read directly from
+    the sorted array instead of re-sorting n times.
+    """
     arr = values.to_numpy(dtype=float)
     out = np.full(len(arr), np.nan)
-    for i in range(len(arr)):
-        others = np.delete(arr, i)
-        others = others[~np.isnan(others)]
-        if len(others):
-            out[i] = np.median(others)
-    return pd.Series(out, index=values.index)
+    valid = ~np.isnan(arr)
+    n = int(valid.sum())
+    if n == 0:
+        return pd.Series(out, index=values.index)
+    if n == 1:
+        # The single valid value has no peers; missing values have exactly that one.
+        out[~valid] = arr[valid][0]
+        return pd.Series(out, index=values.index)
+    order = np.argsort(arr[valid], kind="stable")
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(n)
+    sorted_vals = arr[valid][order]
+
+    m = n - 1
+    lo_k, hi_k = (m - 1) // 2, m // 2  # median positions within the remaining m values
+    # Position in the full sorted array of the k-th remaining value, given removal at r.
+    lo = np.where(lo_k < ranks, lo_k, lo_k + 1)
+    hi = np.where(hi_k < ranks, hi_k, hi_k + 1)
+    medians = (sorted_vals[lo] + sorted_vals[hi]) / 2
+
+    full = np.full(len(arr), np.nan)
+    full[valid] = medians
+    # Missing values still get the median of all valid values (they exclude nothing).
+    full[~valid] = float(np.median(sorted_vals))
+    return pd.Series(full, index=values.index)
 
 
 def add_peer_comparison(snapshot: pd.DataFrame, group_by: str = "peer_group") -> pd.DataFrame:

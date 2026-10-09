@@ -37,7 +37,7 @@ from app.ingest import ingest_company, validate_stored
 from app.market import update_market_series, update_prices
 from app.models import Company, DataQualityFlag, Deal, FinancialStatement, Price
 from app.monte_carlo import simulate
-from app.queries import metrics_as_of, statements_as_of
+from app.queries import metrics_as_of, refresh_metrics, statements_as_of
 from app.screener import PRESETS, Filter, Screen, run_screen
 from app.universe import build_universe, write_universe
 
@@ -92,6 +92,8 @@ def cmd_ingest(args: argparse.Namespace) -> None:
                 continue
             print(f"{entry['ticker']:<6} {_format_counts(count, counts)}")
 
+    with SessionLocal.begin() as session:
+        refresh_metrics(session)
     if skipped:
         print(f"\nSkipped (no us-gaap 10-K data, e.g. 20-F filers): {', '.join(skipped)}")
     if args.prune and not args.tickers:
@@ -118,6 +120,8 @@ def cmd_deals(args: argparse.Namespace) -> None:
             except httpx.HTTPError as e:
                 status = f"FAILED: {e}"
             print(f"{row['target_ticker']:<6} {row['announced']}  {status}")
+    with SessionLocal.begin() as session:
+        refresh_metrics(session)
     verified = sum(r["verified"].strip().lower() in {"y", "yes", "true", "1"} for r in rows)
     print(f"\n{len(rows)} deals loaded, {verified} marked verified")
 
@@ -151,6 +155,30 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         for row in skipped.itertuples():
             print(f"  {row.ticker:<6} {row.status}")
     print(f"\nRan in {elapsed:.1f}s. Per-deal tables and report in {path.parent}")
+
+
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    """Time the full-universe screen (snapshot + peer comparison + filters), computing
+    metrics from the live view vs the materialized view, at several as-of dates."""
+    dates = [date.fromisoformat(d) for d in args.dates] if args.dates else [date.today()]
+    screen = PRESETS["target"]
+    print(f"Median of {args.runs} runs, full universe, preset '{screen.name}'\n")
+    print(f"{'as of':<12}{'companies':>10}{'live view':>12}{'materialized':>14}{'speedup':>9}")
+    for as_of in dates:
+        timings = {}
+        for materialized in (False, True):
+            runs = []
+            for _ in range(args.runs):
+                start = time.perf_counter()
+                with SessionLocal() as session:
+                    comps = add_peer_comparison(valuation_snapshot(session, as_of, materialized))
+                run_screen(comps, screen)
+                runs.append(time.perf_counter() - start)
+            timings[materialized] = statistics.median(runs) * 1000
+        print(
+            f"{as_of.isoformat():<12}{len(comps):>10}{timings[False]:>10.0f}ms"
+            f"{timings[True]:>12.0f}ms{timings[False] / timings[True]:>8.1f}x"
+        )
 
 
 def cmd_prices(args: argparse.Namespace) -> None:
@@ -523,6 +551,11 @@ def main() -> None:
     )
     p_backtest.add_argument("--draws", type=int, default=10_000, help="Monte Carlo draws")
     p_backtest.set_defaults(func=cmd_backtest)
+
+    p_bench = sub.add_parser("benchmark", help="Time the full-universe screen")
+    p_bench.add_argument("dates", nargs="*", help="As-of dates (default: today)")
+    p_bench.add_argument("--runs", type=int, default=15)
+    p_bench.set_defaults(func=cmd_benchmark)
 
     p_prices = sub.add_parser("prices", help="Fetch new daily closes and splits (Yahoo)")
     p_prices.add_argument("tickers", nargs="*")

@@ -50,16 +50,34 @@ def latest_statement_as_of(
     return list(session.scalars(stmt))
 
 
-_METRICS_AS_OF = text(
-    """
-    SELECT DISTINCT ON (m.company_id, m.period_end) c.ticker, m.*
-    FROM v_financial_metrics m
-    JOIN companies c ON c.id = m.company_id
-    WHERE m.filed_date <= :as_of
-      AND (:all_companies OR m.company_id IN :company_ids)
-    ORDER BY m.company_id, m.period_end, m.filed_date DESC, m.accession DESC
-    """
-).bindparams(bindparam("company_ids", expanding=True))
+def _metrics_sql(source: str, latest_only: bool):
+    # Latest version of each (company, period) filed by :as_of; with latest_only, just
+    # each company's most recent period, decided in SQL rather than in pandas.
+    distinct, order = (
+        ("m.company_id", "m.company_id, m.period_end DESC, m.filed_date DESC, m.accession DESC")
+        if latest_only
+        else (
+            "m.company_id, m.period_end",
+            "m.company_id, m.period_end, m.filed_date DESC, m.accession DESC",
+        )
+    )
+    return text(
+        f"""
+        SELECT DISTINCT ON ({distinct}) c.ticker, m.*
+        FROM {source} m
+        JOIN companies c ON c.id = m.company_id
+        WHERE m.filed_date <= :as_of
+          AND (:all_companies OR m.company_id IN :company_ids)
+        ORDER BY {order}
+        """
+    ).bindparams(bindparam("company_ids", expanding=True))
+
+
+_METRICS_QUERIES = {
+    (source, latest): _metrics_sql(source, latest)
+    for source in ("mv_financial_metrics", "v_financial_metrics")
+    for latest in (True, False)
+}
 
 
 def metrics_as_of(
@@ -67,14 +85,17 @@ def metrics_as_of(
     as_of: date,
     company_ids: Sequence[int] | None = None,
     latest_only: bool = False,
+    materialized: bool = True,
 ) -> pd.DataFrame:
     """Derived metrics (growth, margins, FCF, leverage) as known on `as_of`.
 
     One row per company and fiscal period, or with latest_only, just each company's
-    most recent period.
+    most recent period. Reads the materialized view (refreshed after ingest);
+    `materialized=False` computes from the live view, for tests and benchmarks.
     """
+    source = "mv_financial_metrics" if materialized else "v_financial_metrics"
     df = pd.read_sql(
-        _METRICS_AS_OF,
+        _METRICS_QUERIES[(source, latest_only)],
         session.connection(),
         params={
             "as_of": as_of,
@@ -82,6 +103,9 @@ def metrics_as_of(
             "company_ids": list(company_ids) if company_ids else [-1],
         },
     )
-    if latest_only:
-        df = df.sort_values(["company_id", "period_end"]).groupby("company_id").tail(1)
-    return df.reset_index(drop=True)
+    return df.sort_values(["company_id", "period_end"]).reset_index(drop=True)
+
+
+def refresh_metrics(session: Session) -> None:
+    """Recompute the materialized metrics after statements change (ingest, deals)."""
+    session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_financial_metrics"))

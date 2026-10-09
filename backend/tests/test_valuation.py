@@ -65,3 +65,25 @@ def test_score_is_within_peer_group_and_filters_apply():
 
     screen = Screen("t", "", filters=[Filter("market_cap", ">=", 2000)], factors=[Factor("growth")])
     assert run_screen(df, screen)["ticker"].tolist() == ["B", "D", "C"]
+
+
+def _naive_median_excluding_self(values: pd.Series) -> pd.Series:
+    arr = values.to_numpy(dtype=float)
+    out = []
+    for i in range(len(arr)):
+        others = np.delete(arr, i)
+        others = others[~np.isnan(others)]
+        out.append(np.median(others) if len(others) else np.nan)
+    return pd.Series(out, index=values.index, dtype=float)
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 4, 7, 40])
+def test_vectorized_median_excluding_self_matches_naive(n):
+    from app.comps import _median_excluding_self
+
+    rng = np.random.default_rng(n)
+    for _ in range(25):
+        x = rng.normal(10, 5, n).round(1)  # rounding creates ties
+        x[rng.random(n) < 0.25] = np.nan
+        s = pd.Series(x)
+        pd.testing.assert_series_equal(_median_excluding_self(s), _naive_median_excluding_self(s))

@@ -1,6 +1,8 @@
 from datetime import date
 
+import pandas as pd
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -76,7 +78,8 @@ def test_metrics_view_growth_is_point_in_time(session):
     session.add_all([fy22_original, fy23_row, fy22_restated])
     session.flush()
 
-    df = metrics_as_of(session, date(2024, 6, 1), [company.id]).set_index("fiscal_year")
+    df = metrics_as_of(session, date(2024, 6, 1), [company.id], materialized=False)
+    df = df.set_index("fiscal_year")
     fy23_metrics = df.loc[2023]
     # Growth uses the restated comparative from the same 10-K: 120 / 96 - 1
     assert fy23_metrics["revenue_growth"] == pytest.approx(0.25)
@@ -86,8 +89,15 @@ def test_metrics_view_growth_is_point_in_time(session):
     assert fy23_metrics["net_debt"] == 36
     assert fy23_metrics["net_debt_to_ebitda"] == pytest.approx(1.0)
 
-    latest = metrics_as_of(session, date(2024, 6, 1), [company.id], latest_only=True)
+    latest = metrics_as_of(
+        session, date(2024, 6, 1), [company.id], latest_only=True, materialized=False
+    )
     assert latest["fiscal_year"].tolist() == [2023]
+
+    # The materialized view matches the live view once refreshed.
+    session.execute(text("REFRESH MATERIALIZED VIEW mv_financial_metrics"))
+    materialized = metrics_as_of(session, date(2024, 6, 1), [company.id], latest_only=True)
+    pd.testing.assert_frame_equal(materialized, latest)
 
 
 def test_market_cap_adjusts_share_count_for_later_split(session):

@@ -145,6 +145,8 @@ class Price(Base):
     share counts."""
 
     __tablename__ = "prices"
+    # Point-in-time lookups filter on a date window across all companies.
+    __table_args__ = (Index("ix_prices_trade_date", "trade_date"),)
 
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True
