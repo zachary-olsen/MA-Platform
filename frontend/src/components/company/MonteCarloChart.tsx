@@ -7,6 +7,7 @@ const HEIGHT = 190
 const TOP = 26
 const BOTTOM = 62
 const SIDE = 8
+const LABEL_ROOM = 96 // px a bracket label needs beside its tick
 
 /** Histogram of per-share values across draws; P10/P50/P90 bracket and price line. */
 export function MonteCarloChart({ mc, price }: { mc: NonNullable<Valuation['monte_carlo']>; price: number }) {
@@ -56,19 +57,30 @@ export function MonteCarloChart({ mc, price }: { mc: NonNullable<Valuation['mont
             ['p90', 'start', 0],
             ['p50', 'middle', 13],
           ] as const
-        ).map(([k, anchor, dy]) => (
+        ).map(([k, preferred, dy]) => {
+          // Keep labels inside the chart: flip a bracket-end label inward near an edge.
+          const px = x(p[k])
+          const nearLeft = preferred === 'end' && px < LABEL_ROOM
+          const nearRight = preferred === 'start' && px > width - LABEL_ROOM
+          const anchor = nearLeft ? 'start' : nearRight ? 'end' : preferred
+          const flipped = anchor !== preferred
+          return (
           <g key={k}>
-            <line x1={x(p[k])} x2={x(p[k])} y1={bracketY - 4} y2={bracketY + 4} className="bracket" />
+            <line x1={px} x2={px} y1={bracketY - 4} y2={bracketY + 4} className="bracket" />
             <text
-              x={x(p[k]) + (anchor === 'end' ? -4 : anchor === 'start' ? 4 : 0)}
-              y={bracketY + (dy ? 17 + dy : 4)}
+              x={Math.min(
+                Math.max(px + (anchor === 'end' ? -4 : anchor === 'start' ? 4 : 0), SIDE),
+                width - SIDE,
+              )}
+              y={bracketY + (dy ? 17 + dy : flipped ? -8 : 4)}
               className="axis-label strong"
               textAnchor={anchor}
             >
               {k.toUpperCase()} {fmtPrice(p[k])}
             </text>
           </g>
-        ))}
+          )
+        })}
 
         <line x1={x(price)} x2={x(price)} y1={TOP - 8} y2={plotBottom} className="price-line" />
         <text x={x(price)} y={TOP - 13} className="price-label" textAnchor={x(price) > width - 60 ? 'end' : 'middle'}>

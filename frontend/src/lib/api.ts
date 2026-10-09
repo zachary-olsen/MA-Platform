@@ -25,6 +25,7 @@ export interface Preset {
 export interface Meta {
   latest_price_date: string | null
   company_count: number
+  acquired_count: number
   sectors: { name: string; peer_groups: string[] }[]
   presets: Preset[]
   fields: FieldInfo[]

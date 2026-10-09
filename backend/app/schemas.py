@@ -41,7 +41,8 @@ class SectorInfo(BaseModel):
 
 class Meta(BaseModel):
     latest_price_date: date | None
-    company_count: int
+    company_count: int  # currently listed universe
+    acquired_count: int  # deal targets kept for backtests
     sectors: list[SectorInfo]
     presets: list[PresetInfo]
     fields: list[FieldInfo]

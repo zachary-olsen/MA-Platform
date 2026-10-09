@@ -90,7 +90,11 @@ def meta(session: SessionDep):
     )
     return Meta(
         latest_price_date=session.scalar(select(func.max(Price.trade_date))),
-        company_count=session.scalar(select(func.count(Company.id))) or 0,
+        company_count=session.scalar(select(func.count(Company.id)).where(Company.is_active)) or 0,
+        acquired_count=session.scalar(
+            select(func.count(Company.id)).where(Company.is_active.is_(False))
+        )
+        or 0,
         sectors=[
             {"name": s, "peer_groups": sorted(g for g in groups.get(s, []) if g)}
             for s in PEER_GROUPS

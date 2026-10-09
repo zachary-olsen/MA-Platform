@@ -37,7 +37,9 @@ export default function App() {
           </a>
           <div className="masthead-sub">
             {meta.data
-              ? `${meta.data.company_count} US healthcare and semiconductor companies · financials from SEC filings, as known on each date`
+              ? `${meta.data.company_count} listed US healthcare and semiconductor companies${
+                  meta.data.acquired_count ? ` plus ${meta.data.acquired_count} since acquired` : ''
+                } · financials from SEC filings, as known on each date`
               : 'US healthcare and semiconductor companies · financials from SEC filings'}
           </div>
         </div>
