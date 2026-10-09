@@ -1,0 +1,6 @@
+ticker,cik,sector,active,delisted_date
+MSFT,789019,Software,true,
+AAPL,320193,Hardware,true,
+ADBE,796343,Software,true,
+CRM,1108524,Software,true,
+ATVI,718877,Software,false,2023-10-13
