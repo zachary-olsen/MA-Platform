@@ -12,20 +12,29 @@ A side benefit: as-traded history never changes, so updates only append new days
 Source: Yahoo Finance via yfinance, which is unofficial and fine for prototyping. It
 only covers currently listed tickers; delisted backtest targets take their
 pre-announcement price from deal documents instead.
+
+Market-wide series (market_series table): the 10-year Treasury yield from FRED
+(risk-free rate) and SPY (benchmark for beta).
 """
 
-from collections.abc import Iterable
+import io
+from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
 
+import httpx
+import numpy as np
 import pandas as pd
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import Company, Price, StockSplit
+from app.models import Company, MarketSeries, Price, StockSplit
 
 DEFAULT_START = date(2012, 1, 1)
 BATCH_SIZE = 50
+RISK_FREE_SERIES = "DGS10"
+BENCHMARK = "SPY"
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 
 
 def yahoo_symbol(ticker: str) -> str:
@@ -156,3 +165,117 @@ def market_as_of(session: Session, as_of: date) -> pd.DataFrame:
     by then. Companies missing either are absent.
     """
     return pd.read_sql(_MARKET_AS_OF, session.connection(), params={"as_of": as_of})
+
+
+def update_market_series(session: Session) -> dict[str, int]:
+    """Refresh the risk-free rate and benchmark series (small; refetched in full)."""
+    import yfinance as yf
+
+    response = httpx.get(FRED_CSV_URL.format(series=RISK_FREE_SERIES), timeout=30)
+    response.raise_for_status()
+    fred = pd.read_csv(io.StringIO(response.text), na_values=".").dropna()
+    fred.columns = ["obs_date", "value"]
+
+    spy = yf.download(BENCHMARK, start=DEFAULT_START.isoformat(), auto_adjust=True, progress=False)
+    spy_close = spy["Close"].squeeze().dropna()
+
+    series = {
+        RISK_FREE_SERIES: [
+            {"series": RISK_FREE_SERIES, "obs_date": date.fromisoformat(d), "value": v}
+            for d, v in zip(fred["obs_date"], fred["value"], strict=True)
+            if date.fromisoformat(d) >= DEFAULT_START
+        ],
+        BENCHMARK: [
+            {"series": BENCHMARK, "obs_date": d.date(), "value": float(v)}
+            for d, v in spy_close.items()
+        ],
+    }
+    for rows in series.values():
+        stmt = insert(MarketSeries).values(rows)
+        session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["series", "obs_date"], set_={"value": stmt.excluded.value}
+            )
+        )
+    return {name: len(rows) for name, rows in series.items()}
+
+
+def risk_free_rate(session: Session, as_of: date) -> float:
+    """10-year Treasury yield on `as_of` (latest observation), as a decimal."""
+    value = session.scalar(
+        select(MarketSeries.value)
+        .where(MarketSeries.series == RISK_FREE_SERIES, MarketSeries.obs_date <= as_of)
+        .order_by(MarketSeries.obs_date.desc())
+        .limit(1)
+    )
+    if value is None:
+        raise LookupError("No risk-free rate stored; run `python -m app.cli prices`")
+    return float(value) / 100
+
+
+def _split_adjusted_closes(
+    session: Session, company_ids: Sequence[int], start: date, end: date
+) -> pd.DataFrame:
+    """Wide frame of closes (dates x company_id), adjusted so splits aren't returns."""
+    prices = pd.read_sql(
+        select(Price.company_id, Price.trade_date, Price.close).where(
+            Price.company_id.in_(company_ids), Price.trade_date.between(start, end)
+        ),
+        session.connection(),
+    )
+    if prices.empty:
+        return pd.DataFrame()
+    prices["close"] = prices["close"].astype(float)
+    splits = pd.read_sql(
+        select(StockSplit.company_id, StockSplit.split_date, StockSplit.ratio).where(
+            StockSplit.company_id.in_(company_ids),
+            StockSplit.split_date.between(start, end),
+        ),
+        session.connection(),
+    )
+    for split in splits.itertuples():
+        before = (prices["company_id"] == split.company_id) & (
+            prices["trade_date"] < split.split_date
+        )
+        prices.loc[before, "close"] /= float(split.ratio)
+    wide = prices.pivot(index="trade_date", columns="company_id", values="close")
+    wide.index = pd.to_datetime(wide.index)
+    return wide
+
+
+def betas(session: Session, as_of: date, company_ids: Sequence[int], years: int = 2) -> pd.Series:
+    """Beta vs SPY from weekly returns over the `years` before `as_of`.
+
+    Weekly rather than daily returns reduce the downward bias from thinly traded
+    stocks reacting to the market with a lag. Companies with fewer than a year of
+    returns get NaN.
+    """
+    start = as_of - timedelta(days=365 * years + 7)
+    stocks = _split_adjusted_closes(session, company_ids, start, as_of)
+    market = pd.read_sql(
+        select(MarketSeries.obs_date, MarketSeries.value).where(
+            MarketSeries.series == BENCHMARK, MarketSeries.obs_date.between(start, as_of)
+        ),
+        session.connection(),
+        index_col="obs_date",
+        parse_dates=["obs_date"],
+    )["value"].astype(float)
+    if stocks.empty or market.empty:
+        return pd.Series(np.nan, index=list(company_ids), dtype=float)
+
+    weekly = stocks.resample("W-FRI").last().pct_change(fill_method=None)
+    market_weekly = market.resample("W-FRI").last().pct_change()
+    weekly, market_weekly = weekly.align(market_weekly, join="inner", axis=0)
+
+    out = {}
+    for company_id in company_ids:
+        if company_id not in weekly:
+            out[company_id] = np.nan
+            continue
+        pair = pd.concat([weekly[company_id], market_weekly], axis=1).dropna()
+        if len(pair) < 52:
+            out[company_id] = np.nan
+            continue
+        cov = np.cov(pair.iloc[:, 0], pair.iloc[:, 1])
+        out[company_id] = cov[0, 1] / cov[1, 1]
+    return pd.Series(out, dtype=float)

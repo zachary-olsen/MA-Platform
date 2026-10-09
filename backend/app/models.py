@@ -186,3 +186,14 @@ class DataQualityFlag(Base):
     severity: Mapped[str] = mapped_column(String(8))  # error | warning | info
     message: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MarketSeries(Base):
+    """Daily market-wide series: the risk-free rate (FRED DGS10, in percent) and the
+    benchmark index for beta (SPY, total-return adjusted close)."""
+
+    __tablename__ = "market_series"
+
+    series: Mapped[str] = mapped_column(String(16), primary_key=True)
+    obs_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    value: Mapped[Decimal] = mapped_column(Numeric(14, 4))

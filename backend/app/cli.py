@@ -21,10 +21,20 @@ from sqlalchemy.orm import Session
 from app.comps import MULTIPLES, add_peer_comparison, valuation_snapshot
 from app.config import BACKEND_DIR, settings
 from app.db import SessionLocal
+from app.dcf import run_dcf, sensitivity, with_overrides
+from app.dcf_inputs import build_assumptions
 from app.edgar.client import FACTS_URL, SUBMISSIONS_URL, EdgarClient
 from app.edgar.normalize import STANDARD_FIELDS, extract_share_counts, normalize_company_facts
-from app.market import update_prices
-from app.models import Company, DataQualityFlag, FinancialStatement, RawFiling, ShareCount
+from app.market import update_market_series, update_prices
+from app.models import (
+    Company,
+    DataQualityFlag,
+    FinancialStatement,
+    Price,
+    RawFiling,
+    ShareCount,
+)
+from app.monte_carlo import simulate
 from app.queries import metrics_as_of, statements_as_of
 from app.screener import PRESETS, Filter, Screen, run_screen
 from app.universe import build_universe, write_universe
@@ -189,8 +199,12 @@ def cmd_prices(args: argparse.Namespace) -> None:
     with SessionLocal.begin() as session:
         companies = _companies(session, args.tickers)
         added = update_prices(session, companies, full=args.full)
-    missing = sorted(c.ticker for c in companies if c.ticker not in added)
+        series = update_market_series(session)
+    with SessionLocal() as session:
+        priced = set(session.scalars(select(Price.company_id).distinct()))
+    missing = sorted(c.ticker for c in companies if c.id not in priced)
     print(f"Added {sum(added.values()):,} daily closes for {len(added)} companies")
+    print("Market series: " + ", ".join(f"{k} {v:,} obs" for k, v in series.items()))
     if missing:
         print(f"No price data: {', '.join(missing)}")
 
@@ -304,6 +318,93 @@ def cmd_comps(args: argparse.Namespace) -> None:
             view[c] = view[c].map(_multiple)
         view["revenue_growth"] = view["revenue_growth"].map(_pct)
         print("\n" + view.to_string(index=False))
+
+
+def cmd_dcf(args: argparse.Namespace) -> None:
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+    with SessionLocal() as session:
+        company = _company(session, args.ticker)
+        try:
+            a = build_assumptions(
+                session, company.id, as_of, equity_risk_premium=args.erp, years=args.years
+            )
+        except LookupError as e:
+            raise SystemExit(f"{company.ticker}: {e}") from e
+
+    overrides = {
+        "growth_start": args.growth,
+        "margin_start": args.margin,
+        "margin_end": args.margin,
+        "wacc": args.wacc,
+        "terminal_growth": args.terminal_growth,
+    }
+    inputs = with_overrides(a.inputs, **overrides)
+    a.inputs = inputs
+    for key, value in overrides.items():
+        if value is not None:
+            a.notes[key] = "override"
+    result = run_dcf(inputs)
+
+    print(f"{a.name} ({a.ticker}) DCF as of {as_of}, from FY{a.history['fiscal_year'].iloc[-1]}")
+    print("\nAssumptions")
+    rows = [
+        ("Revenue growth, year 1", f"{inputs.growth_start:.1%}", a.notes["growth_start"]),
+        ("Terminal growth", f"{inputs.terminal_growth:.2%}", a.notes["terminal_growth"]),
+        ("EBIT margin, year 1", f"{inputs.margin_start:.1%}", a.notes["margin_start"]),
+        (f"EBIT margin, year {inputs.years}", f"{inputs.margin_end:.1%}", a.notes["margin_end"]),
+        ("Tax rate", f"{inputs.tax_rate:.1%}", a.notes["tax_rate"]),
+        ("D&A % revenue", f"{inputs.d_and_a_pct:.1%}", a.notes["d_and_a_pct"]),
+        ("Capex % revenue", f"{inputs.capex_pct:.1%}", a.notes["capex_pct"]),
+        ("NWC % incremental rev", f"{inputs.nwc_pct:.0%}", a.notes["nwc_pct"]),
+        ("Beta", f"{a.wacc.beta:.2f}", a.notes["beta"]),
+        ("Pre-tax cost of debt", f"{a.wacc.pre_tax_cost_of_debt:.2%}", a.notes["cost_of_debt"]),
+        ("WACC", f"{inputs.wacc:.2%}", a.notes.get("wacc") if args.wacc is None else "override"),
+    ]
+    for label, value, note in rows:
+        print(f"  {label:<24}{value:>8}   {note}")
+
+    proj = result.projection
+    table = pd.DataFrame(
+        {
+            "growth": proj.loc["growth"].map(lambda x: f"{x:.1%}"),
+            "revenue": (proj.loc["revenue"] / 1e6).map(lambda x: f"{x:,.0f}"),
+            "EBIT": (proj.loc["ebit"] / 1e6).map(lambda x: f"{x:,.0f}"),
+            "FCF": (proj.loc["fcf"] / 1e6).map(lambda x: f"{x:,.0f}"),
+            "PV of FCF": (proj.loc["pv_fcf"] / 1e6).map(lambda x: f"{x:,.0f}"),
+        }
+    ).T
+    print("\nProjection (USD millions)")
+    print(table.to_string())
+
+    print(
+        f"\nPV of FCF ${result.pv_explicit / 1e9:,.2f}B + PV of terminal value "
+        f"${result.pv_terminal / 1e9:,.2f}B ({result.terminal_share:.0%} of EV)"
+    )
+    print(
+        f"EV ${result.enterprise_value / 1e9:,.2f}B - net debt ${inputs.net_debt / 1e9:,.2f}B"
+        f" - other claims ${inputs.other_claims / 1e9:,.2f}B = equity "
+        f"${result.equity_value / 1e9:,.2f}B / {inputs.shares / 1e6:,.1f}M shares"
+    )
+    print(
+        f"Value per share {result.value_per_share:,.2f} vs price {a.price:,.2f} "
+        f"({result.value_per_share / a.price - 1:+.0%})"
+    )
+
+    grid = sensitivity(inputs)
+    grid.index = [f"WACC {w:.2%}" for w in grid.index]
+    grid.columns = [f"g {g:.2%}" for g in grid.columns]
+    print("\nSensitivity: value per share")
+    print(grid.map(lambda x: "—" if pd.isna(x) else f"{x:,.2f}").to_string())
+
+    if args.draws:
+        mc = simulate(a, draws=args.draws, seed=args.seed)
+        p = mc.percentiles
+        print(
+            f"\nMonte Carlo ({mc.draws:,} draws, {mc.discarded:,} discarded with WACC - g < 1%;"
+            f" growth sd {a.growth_volatility:.1%}, margin sd {a.margin_volatility:.1%})"
+        )
+        print("  " + "   ".join(f"P{q} {v:,.2f}" for q, v in p.items()))
+        print(f"  P(value > current price {a.price:,.2f}) = {mc.prob_above_price:.0%}")
 
 
 def cmd_build_universe(args: argparse.Namespace) -> None:
@@ -468,6 +569,19 @@ def main() -> None:
     p_comps.add_argument("--as-of")
     p_comps.add_argument("--peers", action="store_true", help="List the peers")
     p_comps.set_defaults(func=cmd_comps)
+
+    p_dcf = sub.add_parser("dcf", help="DCF valuation with sensitivity and Monte Carlo")
+    p_dcf.add_argument("ticker")
+    p_dcf.add_argument("--as-of")
+    p_dcf.add_argument("--growth", type=float, help="Year-1 revenue growth, e.g. 0.12")
+    p_dcf.add_argument("--margin", type=float, help="EBIT margin for all years")
+    p_dcf.add_argument("--wacc", type=float)
+    p_dcf.add_argument("--terminal-growth", type=float)
+    p_dcf.add_argument("--erp", type=float, default=0.05, help="Equity risk premium")
+    p_dcf.add_argument("--years", type=int, default=10)
+    p_dcf.add_argument("--draws", type=int, default=10_000, help="Monte Carlo draws (0 = off)")
+    p_dcf.add_argument("--seed", type=int, default=0)
+    p_dcf.set_defaults(func=cmd_dcf)
 
     p_universe = sub.add_parser("build-universe", help="Regenerate universe.csv from EDGAR")
     p_universe.add_argument(
