@@ -76,15 +76,24 @@ def _bottom_up_beta(
         blume_adjust(raw.reindex(group["company_id"]).to_numpy()), debt_to_equity, MARGINAL_TAX
     )
     median_unlevered = float(np.nanmedian(unlevered))
-    own_de = (company["total_debt"] if pd.notna(company["total_debt"]) else 0) / company[
-        "market_cap"
-    ]
+    own_de = _debt_to_equity(company, group)
     beta = float(relever_beta(median_unlevered, own_de, MARGINAL_TAX))
     n = int(np.isfinite(unlevered).sum())
     return beta, (
         f"peer median unlevered beta {median_unlevered:.2f} ({n} {company['peer_group']} "
         f"companies, {BETA_YEARS}y weekly vs SPY, Blume-adjusted), relevered at D/E {own_de:.2f}"
+        + ("" if pd.notna(company["market_cap"]) else " (peer median: no price for company)")
     )
+
+
+def _debt_to_equity(company: pd.Series, group: pd.DataFrame) -> float:
+    """Market D/E; for a company without a price (an acquired target), the peer median."""
+    if pd.notna(company["market_cap"]) and company["market_cap"] > 0:
+        return (company["total_debt"] if pd.notna(company["total_debt"]) else 0) / company[
+            "market_cap"
+        ]
+    ratios = group["total_debt"].fillna(0) / group["market_cap"]
+    return float(np.nanmedian(ratios[np.isfinite(ratios)])) if np.isfinite(ratios).any() else 0.0
 
 
 def build_assumptions(
@@ -97,11 +106,14 @@ def build_assumptions(
 ) -> Assumptions:
     snapshot = valuation_snapshot(session, as_of) if snapshot is None else snapshot
     match = snapshot[snapshot["company_id"] == company_id]
-    if match.empty or pd.isna(match.iloc[0]["market_cap"]):
-        raise LookupError("No price or share count for this company on that date")
+    if match.empty or pd.isna(match.iloc[0]["shares"]):
+        raise LookupError("No financials or share count for this company on that date")
     company = match.iloc[0]
+    has_price = pd.notna(company["market_cap"])
 
     hist = _history(session, company_id, as_of)
+    if hist.empty:
+        raise LookupError("No revenue history in filings before this date")
     recent = hist.tail(HISTORY_YEARS)
     notes: dict[str, str] = {}
 
@@ -166,14 +178,21 @@ def build_assumptions(
     else:
         cost_of_debt = rf + 0.02
         debt_note = "rf + 2% (no interest/debt data)"
+    if has_price:
+        equity_value, debt_value = float(company["market_cap"]), debt
+    else:
+        # Weight capital by the peer median D/E instead of the company's market value.
+        group = snapshot[snapshot["peer_group"] == company["peer_group"]]
+        de = _debt_to_equity(company, group)
+        equity_value, debt_value = 1.0, de
     wacc = WACC(
         risk_free=rf,
         equity_risk_premium=equity_risk_premium,
         beta=beta,
         pre_tax_cost_of_debt=cost_of_debt,
         tax_rate=MARGINAL_TAX,
-        equity_value=float(company["market_cap"]),
-        debt_value=debt,
+        equity_value=equity_value,
+        debt_value=debt_value,
     )
     notes["beta"] = beta_note
     notes["cost_of_debt"] = debt_note
@@ -208,7 +227,7 @@ def build_assumptions(
         as_of=as_of,
         inputs=inputs,
         wacc=wacc,
-        price=float(company["price"]),
+        price=float(company["price"]) if has_price else float("nan"),
         history=hist,
         growth_volatility=growth_vol,
         margin_volatility=margin_vol,

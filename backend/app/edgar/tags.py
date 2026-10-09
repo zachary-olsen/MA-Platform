@@ -35,6 +35,7 @@ FIELDS: dict[str, FieldSpec] = {
             "RevenueFromContractWithCustomerExcludingAssessedTax",
             "RevenueFromContractWithCustomerIncludingAssessedTax",
             "SalesRevenueNet",
+            "HealthCareOrganizationRevenue",  # hospitals (THC, CYH, LifePoint)
         ),
     ),
     "cost_of_revenue": FieldSpec(

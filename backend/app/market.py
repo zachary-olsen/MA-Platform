@@ -139,20 +139,20 @@ _MARKET_AS_OF = text(
         ORDER BY company_id, filed_date DESC, as_of_date DESC
     )
     SELECT
-        px.company_id,
+        sh.company_id,
         px.trade_date AS price_date,
         px.close::float8 AS price,
         sh.as_of_date AS shares_date,
         (sh.shares * COALESCE(adj.factor, 1))::float8 AS shares,
         (px.close * sh.shares * COALESCE(adj.factor, 1))::float8 AS market_cap
-    FROM px
-    JOIN sh USING (company_id)
+    FROM sh
+    LEFT JOIN px USING (company_id)
     LEFT JOIN LATERAL (
         SELECT exp(sum(ln(s.ratio))) AS factor
         FROM stock_splits s
-        WHERE s.company_id = px.company_id
+        WHERE s.company_id = sh.company_id
           AND s.split_date > sh.as_of_date
-          AND s.split_date <= px.trade_date
+          AND s.split_date <= COALESCE(px.trade_date, :as_of)
     ) adj ON true
     """
 )
@@ -162,7 +162,8 @@ def market_as_of(session: Session, as_of: date) -> pd.DataFrame:
     """Price, split-consistent share count and market cap per company on `as_of`.
 
     Uses the last close within 10 days before `as_of` and the latest share count filed
-    by then. Companies missing either are absent.
+    by then. Companies with a share count but no price (e.g. acquired targets, which
+    Yahoo doesn't cover) are included with NULL price and market cap.
     """
     return pd.read_sql(_MARKET_AS_OF, session.connection(), params={"as_of": as_of})
 

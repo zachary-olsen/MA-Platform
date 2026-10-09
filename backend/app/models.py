@@ -166,8 +166,16 @@ class Deal(Base):
     equity_value: Mapped[Decimal | None] = mapped_column(Money)
     enterprise_value: Mapped[Decimal | None] = mapped_column(Money)
     consideration: Mapped[str | None] = mapped_column(String(16))  # cash | stock | mixed
+    consideration_detail: Mapped[str | None]
+    value_as_announced: Mapped[str | None]  # as worded in the press release
+    # Last day before leaks/rumors moved the price; backtests use the day before
+    # announcement when unset.
+    unaffected_date: Mapped[date | None]
+    verified: Mapped[bool] = mapped_column(default=False)  # checked by hand against source_url
     source_url: Mapped[str]
     notes: Mapped[str | None]
+
+    __table_args__ = (UniqueConstraint("target_company_id", "announcement_date"),)
 
 
 class DataQualityFlag(Base):

@@ -15,30 +15,31 @@ from datetime import date
 
 import httpx
 import pandas as pd
-from sqlalchemy import delete, insert, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.backtest import (
+    acquisitions_by_company,
+    load_cases,
+    ranking_backtest,
+    valuation_backtest,
+)
+from app.backtest_report import render, save
 from app.comps import MULTIPLES, add_peer_comparison, valuation_snapshot
 from app.config import BACKEND_DIR, settings
 from app.db import SessionLocal
 from app.dcf import run_dcf, sensitivity, with_overrides
 from app.dcf_inputs import build_assumptions
-from app.edgar.client import FACTS_URL, SUBMISSIONS_URL, EdgarClient
-from app.edgar.normalize import STANDARD_FIELDS, extract_share_counts, normalize_company_facts
+from app.deals import load_deal, read_deals
+from app.edgar.client import EdgarClient
+from app.edgar.normalize import STANDARD_FIELDS
+from app.ingest import ingest_company, validate_stored
 from app.market import update_market_series, update_prices
-from app.models import (
-    Company,
-    DataQualityFlag,
-    FinancialStatement,
-    Price,
-    RawFiling,
-    ShareCount,
-)
+from app.models import Company, DataQualityFlag, Deal, FinancialStatement, Price
 from app.monte_carlo import simulate
 from app.queries import metrics_as_of, statements_as_of
 from app.screener import PRESETS, Filter, Screen, run_screen
 from app.universe import build_universe, write_universe
-from app.validation import validate_company
 
 UNIVERSE_CSV = BACKEND_DIR / "data" / "universe.csv"
 SEVERITIES = ("error", "warning", "info")
@@ -54,98 +55,6 @@ def load_universe(tickers: list[str] | None) -> list[dict]:
         if missing:
             raise SystemExit(f"Not in {UNIVERSE_CSV.name}: {', '.join(sorted(missing))}")
     return rows
-
-
-def cached_fetch(
-    session: Session, client: EdgarClient, company: Company, endpoint: str, refresh: bool
-) -> dict:
-    cached = session.scalar(
-        select(RawFiling).where(RawFiling.company_id == company.id, RawFiling.endpoint == endpoint)
-    )
-    if cached and not refresh:
-        return cached.payload
-
-    if endpoint == "companyfacts":
-        url, payload = FACTS_URL.format(cik=company.cik), client.company_facts(company.cik)
-    else:
-        url, payload = SUBMISSIONS_URL.format(cik=company.cik), client.submissions(company.cik)
-
-    if cached:
-        session.delete(cached)
-        session.flush()
-    session.add(RawFiling(company_id=company.id, endpoint=endpoint, url=url, payload=payload))
-    return payload
-
-
-def ingest_company(session: Session, client: EdgarClient, entry: dict, refresh: bool) -> int:
-    cik = int(entry["cik"])
-    company = session.scalar(select(Company).where(Company.cik == cik))
-    if company is None:
-        company = Company(cik=cik, ticker=entry["ticker"].upper(), name=entry["ticker"].upper())
-        session.add(company)
-        session.flush()
-
-    submissions = cached_fetch(session, client, company, "submissions", refresh)
-    company.ticker = entry["ticker"].upper()
-    company.name = submissions["name"]
-    company.sic_code = submissions.get("sic") or None
-    company.industry = submissions.get("sicDescription") or None
-    company.fiscal_year_end = submissions.get("fiscalYearEnd") or None
-    company.sector = entry.get("sector") or None
-    company.peer_group = entry.get("peer_group") or None
-    company.is_active = entry.get("active", "true").strip().lower() == "true"
-    delisted = (entry.get("delisted_date") or "").strip()
-    company.delisted_date = date.fromisoformat(delisted) if delisted else None
-
-    facts = cached_fetch(session, client, company, "companyfacts", refresh)
-    rows = normalize_company_facts(facts)
-    if not rows:
-        # No us-gaap 10-K data, e.g. a foreign issuer filing 20-Fs.
-        session.delete(company)
-        return 0
-
-    # Deleting statements cascades to their data quality flags.
-    session.execute(delete(FinancialStatement).where(FinancialStatement.company_id == company.id))
-    session.execute(insert(FinancialStatement), [{"company_id": company.id, **row} for row in rows])
-
-    share_counts = extract_share_counts(facts)
-    session.execute(delete(ShareCount).where(ShareCount.company_id == company.id))
-    if share_counts:
-        session.execute(
-            insert(ShareCount), [{"company_id": company.id, **row} for row in share_counts]
-        )
-    return len(rows)
-
-
-def validate_stored(session: Session, company: Company) -> Counter:
-    statements = session.scalars(
-        select(FinancialStatement).where(FinancialStatement.company_id == company.id)
-    )
-    rows = [
-        {
-            "id": s.id,
-            "period_end": s.period_end,
-            "filed_date": s.filed_date,
-            "accession": s.accession,
-            "tag_sources": s.tag_sources,
-            **{f: None if getattr(s, f) is None else float(getattr(s, f)) for f in STANDARD_FIELDS},
-        }
-        for s in statements
-    ]
-    flags = validate_company(rows)
-
-    session.execute(delete(DataQualityFlag).where(DataQualityFlag.company_id == company.id))
-    session.add_all(
-        DataQualityFlag(
-            company_id=company.id,
-            statement_id=f.statement_id,
-            check=f.check,
-            severity=f.severity,
-            message=f.message,
-        )
-        for f in flags
-    )
-    return Counter(f.severity for f in flags)
 
 
 def _format_counts(row_count: int, counts: Counter) -> str:
@@ -188,11 +97,60 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     if args.prune and not args.tickers:
         keep = {int(e["cik"]) for e in universe}
         with SessionLocal.begin() as session:
-            stale = session.scalars(select(Company).where(Company.cik.not_in(keep))).all()
+            # Acquired deal targets aren't in the universe file but must be kept.
+            deal_targets = select(Deal.target_company_id)
+            stale = session.scalars(
+                select(Company).where(Company.cik.not_in(keep), Company.id.not_in(deal_targets))
+            ).all()
             for company in stale:
                 session.delete(company)
         if stale:
             print(f"Pruned (not in universe): {', '.join(c.ticker for c in stale)}")
+
+
+def cmd_deals(args: argparse.Namespace) -> None:
+    rows = read_deals()
+    with EdgarClient(settings.sec_user_agent) as client:
+        for row in rows:
+            try:
+                with SessionLocal.begin() as session:
+                    status = load_deal(session, client, row, args.refresh)
+            except httpx.HTTPError as e:
+                status = f"FAILED: {e}"
+            print(f"{row['target_ticker']:<6} {row['announced']}  {status}")
+    verified = sum(r["verified"].strip().lower() in {"y", "yes", "true", "1"} for r in rows)
+    print(f"\n{len(rows)} deals loaded, {verified} marked verified")
+
+
+def cmd_backtest(args: argparse.Namespace) -> None:
+    with SessionLocal() as session:
+        cases = load_cases(session, args.include_unverified, cash_only=False)
+        acquisitions = acquisitions_by_company(session)
+        if not cases:
+            raise SystemExit(
+                "No verified deals. Mark rows verified in deals_candidates.csv and run "
+                "`python -m app.cli deals`, or pass --include-unverified for a provisional run."
+            )
+        verified = sum(c.verified for c in cases)
+        provisional = verified < len(cases)
+        valuation_cases = [c for c in cases if c.consideration == "cash" or args.all_consideration]
+
+        start = time.perf_counter()
+        ranking = ranking_backtest(cases, args.lookback, all_acquisitions=acquisitions)
+        valuation = valuation_backtest(session, valuation_cases, draws=args.draws)
+        elapsed = time.perf_counter() - start
+
+    report = render(
+        ranking, valuation, provisional=provisional, cases=len(cases), verified=verified
+    )
+    path = save(ranking, valuation, report)
+    print(report)
+    skipped = ranking["table"][ranking["table"]["status"] != "ok"]
+    if not skipped.empty:
+        print("\nNot ranked:")
+        for row in skipped.itertuples():
+            print(f"  {row.ticker:<6} {row.status}")
+    print(f"\nRan in {elapsed:.1f}s. Per-deal tables and report in {path.parent}")
 
 
 def cmd_prices(args: argparse.Namespace) -> None:
@@ -546,6 +504,25 @@ def main() -> None:
         "--prune", action="store_true", help="Delete companies no longer in universe.csv"
     )
     p_ingest.set_defaults(func=cmd_ingest)
+
+    p_deals = sub.add_parser("deals", help="Load deals_candidates.csv and ingest targets")
+    p_deals.add_argument("--refresh", action="store_true", help="Ignore cached responses")
+    p_deals.set_defaults(func=cmd_deals)
+
+    p_backtest = sub.add_parser("backtest", help="Screener and valuation backtests on deals")
+    p_backtest.add_argument(
+        "--include-unverified", action="store_true", help="Provisional run on unverified deals"
+    )
+    p_backtest.add_argument(
+        "--lookback", type=int, default=365, help="Days before announcement for the ranking"
+    )
+    p_backtest.add_argument(
+        "--all-consideration",
+        action="store_true",
+        help="Include stock and mixed deals in the valuation test (default: cash only)",
+    )
+    p_backtest.add_argument("--draws", type=int, default=10_000, help="Monte Carlo draws")
+    p_backtest.set_defaults(func=cmd_backtest)
 
     p_prices = sub.add_parser("prices", help="Fetch new daily closes and splits (Yahoo)")
     p_prices.add_argument("tickers", nargs="*")
