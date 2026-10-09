@@ -5,7 +5,8 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db import engine
-from app.models import Company, FinancialStatement
+from app.market import market_as_of
+from app.models import Company, FinancialStatement, Price, ShareCount, StockSplit
 from app.queries import latest_statement_as_of, metrics_as_of, statements_as_of
 
 
@@ -87,3 +88,34 @@ def test_metrics_view_growth_is_point_in_time(session):
 
     latest = metrics_as_of(session, date(2024, 6, 1), [company.id], latest_only=True)
     assert latest["fiscal_year"].tolist() == [2023]
+
+
+def test_market_cap_adjusts_share_count_for_later_split(session):
+    company = Company(cik=9_999_999_997, ticker="TEST3", name="Test Co 3")
+    session.add(company)
+    session.flush()
+    session.add_all(
+        [
+            ShareCount(
+                company_id=company.id,
+                accession="test-sc",
+                form="10-Q",
+                as_of_date=date(2024, 5, 20),
+                filed_date=date(2024, 5, 29),
+                shares=2_460_000_000,
+                source="test",
+            ),
+            StockSplit(company_id=company.id, split_date=date(2024, 6, 10), ratio=10),
+            Price(company_id=company.id, trade_date=date(2024, 6, 7), close=1200, source="t"),
+            Price(company_id=company.id, trade_date=date(2024, 6, 14), close=130, source="t"),
+        ]
+    )
+    session.flush()
+
+    def cap(day):
+        df = market_as_of(session, day)
+        return df.loc[df.company_id == company.id, "market_cap"].item()
+
+    assert cap(date(2024, 6, 7)) == pytest.approx(1200 * 2.46e9)  # before split
+    assert cap(date(2024, 6, 14)) == pytest.approx(130 * 24.6e9)  # shares x10 after split
+    assert market_as_of(session, date(2024, 5, 28)).query("company_id == @company.id").empty

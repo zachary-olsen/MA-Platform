@@ -23,6 +23,8 @@ GOOD = {
     "total_equity": 800.0,
     "total_debt": 500.0,
     "shares_outstanding": 99.0,
+    "minority_interest": None,
+    "temporary_equity": None,
 }
 
 
@@ -49,6 +51,10 @@ def test_clean_row_has_no_flags():
 
 def test_balance_sheet_identity():
     assert (1, "balance_sheet_identity", "warning") in checks([row(total_equity=700.0)])
+
+
+def test_identity_counts_minority_interest_and_temporary_equity():
+    assert checks([row(total_equity=700.0, minority_interest=60.0, temporary_equity=40.0)]) == set()
 
 
 def test_identity_skipped_when_liabilities_derived_from_it():

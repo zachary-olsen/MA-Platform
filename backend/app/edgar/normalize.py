@@ -157,6 +157,23 @@ def derive(row: dict, helpers: dict[str, float | None], sources: dict[str, str])
         row["revenue"] = sum(helpers[n] for n in components)
         sources["revenue"] = "derived:" + "+".join(components)
 
+    # Companies without an operating income subtotal: EBIT ~ pretax income + interest.
+    if row["operating_income"] is None and row["pretax_income"] is not None:
+        row["operating_income"] = row["pretax_income"] + (row["interest_expense"] or 0)
+        sources["operating_income"] = "derived:pretax_income+interest_expense"
+
+    redeemable_nci = helpers["RedeemableNoncontrollingInterest"]
+    if redeemable_nci is not None:
+        row["minority_interest"] = (row["minority_interest"] or 0) + redeemable_nci
+        sources["minority_interest"] = "derived:" + "+".join(
+            ([sources["minority_interest"]] if "minority_interest" in sources else [])
+            + ["RedeemableNoncontrollingInterestEquityCarryingAmount"]
+        )
+    temp_incl_nci = helpers["TemporaryEquityIncludingNCI"]
+    if row["temporary_equity"] is None and temp_incl_nci is not None:
+        row["temporary_equity"] = temp_incl_nci - (redeemable_nci or 0)
+        sources["temporary_equity"] = "derived:TemporaryEquityIncludingNCI-RedeemableNCI"
+
     if row["gross_profit"] is None and None not in (row["revenue"], row["cost_of_revenue"]):
         row["gross_profit"] = row["revenue"] - row["cost_of_revenue"]
         sources["gross_profit"] = "derived:revenue-cost_of_revenue"
@@ -233,6 +250,8 @@ def normalize_company_facts(company_facts: dict) -> list[dict]:
         sources: dict[str, str] = {}
         for field, spec in FIELDS.items():
             tag, value = index.lookup(spec, period)
+            if spec.unit == "shares" and value == 0:
+                tag, value = None, None  # e.g. pre-spin-off periods report 0 shares
             row[field] = value
             if tag:
                 sources[field] = tag
@@ -259,3 +278,51 @@ def normalize_company_facts(company_facts: dict) -> list[dict]:
     _carry_forward(rows)
     rows.sort(key=lambda r: (r["period_end"], r["filed_date"], r["accession"]))
     return rows
+
+
+SHARE_COUNT_FORMS = {"10-K", "10-K/A", "10-Q", "10-Q/A"}
+
+
+def extract_share_counts(company_facts: dict) -> list[dict]:
+    """Shares outstanding per 10-K/10-Q filing, for point-in-time market cap.
+
+    Preference per filing: the cover-page count (dated close to the filing date),
+    then the balance sheet count. If the cover reports several values for one date,
+    they are share classes reported without dimensions, so they are summed.
+    """
+    facts = company_facts.get("facts", {})
+    sources = (
+        ("dei", COVER_SHARES_TAG),
+        ("us-gaap", "CommonStockSharesOutstanding"),
+    )
+
+    by_accession: dict[str, dict] = {}
+    for namespace, tag in sources:
+        entries = facts.get(namespace, {}).get(tag, {}).get("units", {}).get("shares", [])
+        values: dict[tuple[str, str], set[float]] = defaultdict(set)
+        meta: dict[str, dict] = {}
+        for fact in entries:
+            if fact.get("form") not in SHARE_COUNT_FORMS:
+                continue
+            values[(fact["accn"], fact["end"])].add(fact["val"])
+            meta[fact["accn"]] = fact
+
+        latest_end: dict[str, str] = {}
+        for accession, end in values:
+            latest_end[accession] = max(end, latest_end.get(accession, end))
+
+        for accession, end in latest_end.items():
+            if accession in by_accession:
+                continue  # a higher-priority source already covered this filing
+            vals = values[(accession, end)]
+            if sum(vals) <= 0:
+                continue
+            by_accession[accession] = {
+                "accession": accession,
+                "form": meta[accession]["form"],
+                "as_of_date": date.fromisoformat(end),
+                "filed_date": date.fromisoformat(meta[accession]["filed"]),
+                "shares": sum(vals),
+                "source": f"{namespace}:{tag}" + (" (sum of classes)" if len(vals) > 1 else ""),
+            }
+    return sorted(by_accession.values(), key=lambda r: (r["filed_date"], r["accession"]))

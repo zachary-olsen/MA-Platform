@@ -32,6 +32,7 @@ class Company(Base):
     ticker: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str]
     sector: Mapped[str | None]  # our own grouping, from universe.csv
+    peer_group: Mapped[str | None]  # sub-industry used for comps
     sic_code: Mapped[str | None] = mapped_column(String(4))
     industry: Mapped[str | None]  # SEC's SIC description
     fiscal_year_end: Mapped[str | None] = mapped_column(String(4))  # MMDD
@@ -99,12 +100,50 @@ class FinancialStatement(Base):
     total_equity: Mapped[Decimal | None] = mapped_column(Money)
     total_debt: Mapped[Decimal | None] = mapped_column(Money)  # excludes operating leases
     shares_outstanding: Mapped[Decimal | None] = mapped_column(Money)
+    minority_interest: Mapped[Decimal | None] = mapped_column(Money)  # incl. redeemable NCI
+    temporary_equity: Mapped[Decimal | None] = mapped_column(Money)  # e.g. redeemable preferred
 
     # field -> XBRL tag used, "derived:..." or "carried:<accession>"
     tag_sources: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+class ShareCount(Base):
+    """Shares outstanding as reported on each 10-K/10-Q, for point-in-time market cap.
+
+    Counts are as reported at the time; splits after as_of_date are applied when
+    pairing them with a price (see app/market.py).
+    """
+
+    __tablename__ = "share_counts"
+    __table_args__ = (
+        UniqueConstraint("company_id", "accession"),
+        Index("ix_share_counts_company_filed", "company_id", "filed_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"))
+    accession: Mapped[str] = mapped_column(String(20))
+    form: Mapped[str] = mapped_column(String(10))
+    as_of_date: Mapped[date]
+    filed_date: Mapped[date]
+    shares: Mapped[Decimal] = mapped_column(Money)
+    source: Mapped[str]
+
+
+class StockSplit(Base):
+    __tablename__ = "stock_splits"
+
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True
+    )
+    split_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    ratio: Mapped[Decimal] = mapped_column(Numeric(12, 6))  # 10 for a 10-for-1 split
+
+
 class Price(Base):
+    """Daily close as actually traded (NOT split-adjusted), to pair with as-reported
+    share counts."""
+
     __tablename__ = "prices"
 
     company_id: Mapped[int] = mapped_column(

@@ -54,8 +54,14 @@ FIELDS: dict[str, FieldSpec] = {
     ),
     "income_tax": FieldSpec("duration", ("IncomeTaxExpenseBenefit",)),
     "net_income": FieldSpec("duration", ("NetIncomeLoss", "ProfitLoss")),
+    # Loss-making companies often report one combined basic-and-diluted count.
     "diluted_shares": FieldSpec(
-        "duration", ("WeightedAverageNumberOfDilutedSharesOutstanding",), unit="shares"
+        "duration",
+        (
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+            "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+        ),
+        unit="shares",
     ),
     # Some companies (e.g. CRM) tag a depreciation-only footnote with one of these and the
     # cash flow statement's total D&A with another; the total is the largest.
@@ -77,7 +83,14 @@ FIELDS: dict[str, FieldSpec] = {
     ),
     "capex": FieldSpec(
         "duration",
-        ("PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"),
+        (
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsToAcquireProductiveAssets",
+            "PaymentsForCapitalImprovements",
+            "PaymentsToAcquireMachineryAndEquipment",
+            # LLY tags its whole capex line this way; last because it can be a component.
+            "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+        ),
     ),
     "cash": FieldSpec(
         "instant",
@@ -106,10 +119,23 @@ FIELDS: dict[str, FieldSpec] = {
         ),
     ),
     "shares_outstanding": FieldSpec("instant", ("CommonStockSharesOutstanding",), unit="shares"),
+    # Claims on the business besides common equity and liabilities. Both belong in the
+    # EV bridge and in Assets = Liabilities + Equity + these.
+    "minority_interest": FieldSpec("instant", ("MinorityInterest",)),
+    "temporary_equity": FieldSpec(
+        "instant", ("TemporaryEquityCarryingAmountAttributableToParent",)
+    ),
 }
 
 # Tags read only as inputs to derived fields (see normalize.derive).
 HELPER_TAGS: dict[str, FieldSpec] = {
+    "RedeemableNoncontrollingInterest": FieldSpec(
+        "instant", ("RedeemableNoncontrollingInterestEquityCarryingAmount",)
+    ),
+    "TemporaryEquityIncludingNCI": FieldSpec(
+        "instant",
+        ("TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests",),
+    ),
     "SalesRevenueGoodsNet": FieldSpec("duration", ("SalesRevenueGoodsNet",)),
     "SalesRevenueServicesNet": FieldSpec("duration", ("SalesRevenueServicesNet",)),
     "Depreciation": FieldSpec("duration", ("Depreciation",)),

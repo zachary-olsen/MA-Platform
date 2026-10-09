@@ -198,3 +198,33 @@ def test_last_resort_debt_tags_only_without_standard_ones():
 
     with_standard = {**base, "LongTermDebtNoncurrent": [fact(70, end, FILING_24)]}
     assert normalize_company_facts(payload(**with_standard))[0]["total_debt"] == 70
+
+
+def test_operating_income_approximated_from_pretax_and_interest():
+    rows = normalize_company_facts(
+        payload(
+            Revenues=[fact(100, FY24, FILING_24)],
+            IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest=[
+                fact(20, FY24, FILING_24)
+            ],
+            InterestExpense=[fact(5, FY24, FILING_24)],
+        )
+    )
+    assert rows[0]["operating_income"] == 25
+    assert rows[0]["tag_sources"]["operating_income"] == "derived:pretax_income+interest_expense"
+
+
+def test_minority_interest_includes_redeemable_nci():
+    end = "2024-06-30"
+    rows = normalize_company_facts(
+        payload(
+            Revenues=[fact(100, FY24, FILING_24)],
+            MinorityInterest=[fact(30, end, FILING_24)],
+            RedeemableNoncontrollingInterestEquityCarryingAmount=[fact(10, end, FILING_24)],
+            TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests=[
+                fact(25, end, FILING_24)
+            ],
+        )
+    )
+    assert rows[0]["minority_interest"] == 40
+    assert rows[0]["temporary_equity"] == 15  # 25 including the redeemable NCI, minus it

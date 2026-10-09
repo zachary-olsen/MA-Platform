@@ -79,15 +79,15 @@ def check_row(row: dict) -> list[tuple[str, str, str]]:
     if _all_present(row, "total_assets", "total_liabilities", "total_equity") and not _is_derived(
         row, "total_liabilities"
     ):
-        gap = row["total_assets"] - row["total_liabilities"] - row["total_equity"]
+        other_claims = (row["minority_interest"] or 0) + (row["temporary_equity"] or 0)
+        gap = row["total_assets"] - row["total_liabilities"] - row["total_equity"] - other_claims
         if row["total_assets"] > 0 and abs(gap) / row["total_assets"] > IDENTITY_TOLERANCE:
             out.append(
                 (
                     "balance_sheet_identity",
                     "warning",
-                    f"Assets - liabilities - equity = {_m(gap)} "
-                    f"({gap / row['total_assets']:.1%} of assets; minority interest or "
-                    "temporary equity can explain this)",
+                    f"Assets - liabilities - equity - minority interest - temporary equity "
+                    f"= {_m(gap)} ({gap / row['total_assets']:.1%} of assets)",
                 )
             )
 
@@ -133,6 +133,11 @@ def check_row(row: dict) -> list[tuple[str, str, str]]:
 
     if row["total_debt"] is None:
         out.append(("no_debt_reported", "info", "No debt tags; treated as zero debt"))
+
+    if _is_derived(row, "operating_income"):
+        out.append(
+            ("approximate_ebit", "info", "Operating income approximated as pretax + interest")
+        )
 
     if _is_derived(row, "d_and_a"):
         out.append(
